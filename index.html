@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Infinite Parkour</title>
+<style>
+body{
+    margin:0;
+    overflow:auto;
+    background:#87CEEB;
+    font-family:Arial;
+}
+canvas{
+    display:block;
+    position:fixed;
+    inset:0;
+    z-index:0;
+}
+#ui{
+    position:absolute;
+    top:10px;
+    left:10px;
+    color:white;
+    text-shadow:2px 2px 4px black;
+    font-size:20px;
+    z-index:1;
+    pointer-events:none;
+}
+#leaderboard{
+    position:fixed;
+    top:10px;
+    right:10px;
+    z-index:2;
+    width:min(300px,calc(100vw - 32px));
+    max-height:calc(100vh - 20px);
+    overflow:auto;
+    box-sizing:border-box;
+    padding:12px;
+    border-radius:8px;
+    background:rgba(0,20,45,.88);
+    color:white;
+    text-shadow:none;
+    box-shadow:0 2px 10px #0006;
+}
+#leaderboard h2,#gameOver h2{
+    margin:0 0 8px;
+}
+#leaderboard ol{
+    margin:8px 0;
+    padding-left:28px;
+}
+#leaderboard li{
+    padding:3px 0;
+    overflow-wrap:anywhere;
+}
+#leaderboard form,#gameOver form{
+    display:grid;
+    gap:7px;
+    margin-top:8px;
+}
+#leaderboard input,#gameOver input,#leaderboard button,#gameOver button{
+    box-sizing:border-box;
+    width:100%;
+    padding:7px;
+}
+#leaderboard details{
+    margin-top:10px;
+    font-size:13px;
+}
+#leaderboard pre{
+    white-space:pre-wrap;
+    overflow-wrap:anywhere;
+    font-size:11px;
+}
+#leaderboardStatus,#gameOverStatus{
+    min-height:1em;
+    margin:6px 0 0;
+    font-size:13px;
+    overflow-wrap:anywhere;
+}
+#gameOver{
+    display:none;
+    position:fixed;
+    z-index:3;
+    top:50%;
+    left:50%;
+    transform:translate(-50%,-50%);
+    box-sizing:border-box;
+    width:min(360px,calc(100vw - 32px));
+    padding:18px;
+    border-radius:10px;
+    background:rgba(0,20,45,.96);
+    color:white;
+    box-shadow:0 4px 24px #0009;
+}
+</style>
+</head>
+<body>
+
+<div id="ui">
+    <div>Score: <span id="score">0</span></div>
+    <div>Altitude: <span id="altitude">0</span></div>
+    <div>World Best: <span id="highscore">—</span></div>
+    <div style="font-size:14px">Move: A/D or arrows | Jump: Space</div>
+</div>
+
+<aside id="leaderboard" aria-label="Worldwide leaderboard">
+    <h2>Worldwide Leaderboard</h2>
+    <ol id="leaderboardEntries"></ol>
+    <p id="leaderboardStatus" role="status">Configure Supabase to load scores.</p>
+    <button id="refreshLeaderboard" type="button">Refresh leaderboard</button>
+    <details>
+        <summary>Connect a Supabase project</summary>
+        <p>Use the same project URL and public anon/publishable key for everyone. Never enter a service-role or secret key here.</p>
+        <form id="configForm">
+            <label for="projectUrl">Project URL</label>
+            <input id="projectUrl" type="url" placeholder="https://your-project.supabase.co" required>
+            <label for="publicKey">Public anon/publishable key</label>
+            <input id="publicKey" type="password" autocomplete="off" required>
+            <button type="submit">Save connection</button>
+        </form>
+        <p>Create the table and policies once in Supabase SQL Editor:</p>
+        <pre>create table public.parkour_scores (
+  id bigint generated always as identity primary key,
+  name text not null check (char_length(name) between 1 and 20),
+  score integer not null check (score between 0 and 1000000),
+  created_at timestamptz not null default now()
+);
+alter table public.parkour_scores enable row level security;
+create policy "Public can read scores"
+  on public.parkour_scores for select to anon using (true);
+create policy "Public can submit scores"
+  on public.parkour_scores for insert to anon
+  with check (char_length(name) between 1 and 20 and score between 0 and 1000000);
+grant select, insert on public.parkour_scores to anon;
+grant usage, select on sequence public.parkour_scores_id_seq to anon;</pre>
+    </details>
+</aside>
+
+<section id="gameOver" role="dialog" aria-modal="true" aria-labelledby="gameOverTitle">
+    <h2 id="gameOverTitle">Run over</h2>
+    <p>Your score: <strong id="finalScore">0</strong></p>
+    <form id="scoreForm">
+        <label for="playerName">Name for the leaderboard (optional)</label>
+        <input id="playerName" type="text" maxlength="20" placeholder="Anonymous">
+        <button id="submitScore" type="submit">Submit score</button>
+        <button id="skipScore" type="button">Skip and play again</button>
+    </form>
+    <p id="gameOverStatus" role="status"></p>
+</section>
+
+<canvas id="game"></canvas>
+
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+function resize(){
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener("resize", resize);
+
+const highScoreDisplay = document.getElementById("highscore");
+const scoreDisplay = document.getElementById("score");
+const altitudeDisplay = document.getElementById("altitude");
+const leaderboardEntries = document.getElementById("leaderboardEntries");
+const leaderboardStatus = document.getElementById("leaderboardStatus");
+const gameOverPanel = document.getElementById("gameOver");
+const gameOverStatus = document.getElementById("gameOverStatus");
+const playerNameInput = document.getElementById("playerName");
+const scoreForm = document.getElementById("scoreForm");
+const submitScoreButton = document.getElementById("submitScore");
+const configForm = document.getElementById("configForm");
+const projectUrlInput = document.getElementById("projectUrl");
+const publicKeyInput = document.getElementById("publicKey");
+
+let gameOver = false;
+let submittingScore = false;
+let leaderboardConfig = loadLeaderboardConfig();
+
+if(leaderboardConfig){
+    projectUrlInput.value = leaderboardConfig.url;
+    publicKeyInput.value = leaderboardConfig.key;
+}
+
+const keys = {};
+
+window.addEventListener("keydown", e=>{
+    if(e.code === "Space" || e.key.startsWith("Arrow")){
+        e.preventDefault();
+    }
+    if(gameOver)
+        return;
+    keys[e.key.toLowerCase()] = true;
+});
+
+window.addEventListener("keyup", e=>{
+    keys[e.key.toLowerCase()] = false;
+});
+
+window.addEventListener("blur",()=>{
+    for(const key in keys)
+        keys[key] = false;
+});
+
+const player = {
+    x:100,
+    y:470,
+    w:30,
+    h:30,
+    vx:0,
+    vy:0,
+    speed:6,
+    jumps:0,
+    jumpLock:false
+};
+
+let cameraY = 0;
+let platforms = [];
+let highestAltitude = 0;
+let lavaY = 900;
+let lavaSpeed = 0.15;
+let lastFrameTime = 0;
+
+function makePlatform(x,y,w){
+    const platform = {x,y,w,h:20,enemy:null,laser:null};
+
+    platform.falling = Math.random() < 0.2;
+    platform.fallTimer = 0;
+    platform.isFalling = false;
+
+    if(y < 500 && Math.random() < 0.35){
+        platform.enemy = {
+            x:x + Math.random() * Math.max(0,w - 20),
+            y:y - 20,
+            w:20,
+            h:20,
+            dir:Math.random() < 0.5 ? -1 : 1,
+            speed:1 + Math.random() * 3,
+            minX:x,
+            maxX:x + w - 20
+        };
+    }else if(y < 500 && Math.random() < 0.30){
+        platform.laser = {
+            x:x + 10,
+            y:y - 42,
+            width:Math.max(20,w - 20),
+            active:false,
+            timer:Math.random() * 90
+        };
+    }
+
+    return platform;
+}
+
+platforms.push(makePlatform(0,500,400));
+
+function generateWorld(){
+    while(platforms.length < 28){
+        const last = platforms[platforms.length-1];
+        const altitude = Math.max(0,500-last.y);
+        const difficulty = Math.min(1,altitude/10000);
+        const width = 80 - difficulty * 25 + Math.random() * 15;
+        const nextY = last.y - (95 + Math.random() * 65);
+        const direction = Math.random() < 0.5 ? -1 : 1;
+        const centerOffset = direction * (110 + Math.random() * 120);
+        const nextX = last.x + (last.w - width) / 2 + centerOffset;
+
+        platforms.push(makePlatform(nextX,nextY,width));
+    }
+}
+
+function loadLeaderboardConfig(){
+    try{
+        const saved = JSON.parse(localStorage.getItem("parkourSupabaseConfig") || "null");
+        if(saved && typeof saved.url === "string" && typeof saved.key === "string")
+            return saved;
+    }catch(error){
+        console.error("Could not read leaderboard configuration:",error);
+    }
+    return null;
+}
+
+function setLeaderboardStatus(message){
+    leaderboardStatus.textContent = message;
+}
+
+async function fetchLeaderboard(){
+    if(!leaderboardConfig){
+        leaderboardEntries.replaceChildren();
+        highScoreDisplay.textContent = "—";
+        setLeaderboardStatus("Connect a Supabase project to load the worldwide leaderboard.");
+        return;
+    }
+
+    setLeaderboardStatus("Loading scores…");
+    try{
+        const response = await fetch(
+            `${leaderboardConfig.url}/rest/v1/parkour_scores?select=name,score&order=score.desc,created_at.asc&limit=10`,
+            {
+                headers:{
+                    apikey:leaderboardConfig.key,
+                    Authorization:`Bearer ${leaderboardConfig.key}`
+                }
+            }
+        );
+        if(!response.ok)
+            throw new Error(`Leaderboard request failed (${response.status}). Check the project settings and table policies.`);
+
+        const scores = await response.json();
+        leaderboardEntries.replaceChildren();
+        for(const entry of scores){
+            const item = document.createElement("li");
+            item.textContent = `${entry.name} — ${entry.score}`;
+            leaderboardEntries.appendChild(item);
+        }
+        highScoreDisplay.textContent = scores.length ? scores[0].score : "0";
+        setLeaderboardStatus(scores.length ? "Worldwide top scores" : "No scores yet. Be the first!");
+    }catch(error){
+        console.error("Could not load worldwide leaderboard:",error);
+        setLeaderboardStatus(error.message);
+    }
+}
+
+async function submitLeaderboardScore(score,name){
+    if(!leaderboardConfig)
+        throw new Error("Connect a Supabase project in the leaderboard panel before submitting.");
+
+    const response = await fetch(`${leaderboardConfig.url}/rest/v1/parkour_scores`,{
+        method:"POST",
+        headers:{
+            apikey:leaderboardConfig.key,
+            Authorization:`Bearer ${leaderboardConfig.key}`,
+            "Content-Type":"application/json",
+            Prefer:"return=minimal"
+        },
+        body:JSON.stringify({name:name || "Anonymous",score})
+    });
+    if(!response.ok)
+        throw new Error(`Score submission failed (${response.status}). Check the table and insert policy.`);
+}
+
+function resetGame(){
+    gameOver = true;
+    submittingScore = false;
+    document.getElementById("finalScore").textContent = Math.floor(highestAltitude);
+    playerNameInput.value = "";
+    gameOverStatus.textContent = "";
+    submitScoreButton.disabled = false;
+    gameOverPanel.style.display = "block";
+    playerNameInput.focus();
+}
+
+function restartGame(){
+    gameOver = false;
+    player.x = 100;
+    player.y = 470;
+    player.vx = 0;
+    player.vy = 0;
+    player.jumps = 0;
+    platforms = [makePlatform(0,500,400)];
+    highestAltitude = 0;
+    lavaY = 900;
+    lavaSpeed = 0.15;
+    cameraY = player.y - canvas.height / 2;
+    scoreDisplay.textContent = "0";
+    altitudeDisplay.textContent = "0";
+    generateWorld();
+}
+
+function update(delta){
+    if(gameOver)
+        return;
+    const step = Math.min(delta / (1000 / 60),2);
+    generateWorld();
+
+    const altitude = Math.max(0,500-player.y);
+    highestAltitude = Math.max(highestAltitude,altitude);
+    scoreDisplay.textContent = Math.floor(highestAltitude);
+    altitudeDisplay.textContent = Math.floor(altitude);
+
+    if(keys["a"] || keys["arrowleft"])
+        player.vx = -player.speed * step;
+    else if(keys["d"] || keys["arrowright"])
+        player.vx = player.speed * step;
+    else
+        player.vx *= Math.pow(0.8,step);
+
+    const jumpPressed = keys[" "] || keys["space"];
+
+    if(jumpPressed && !player.jumpLock){
+        if(player.jumps < 1){
+            player.vy = -12;
+            player.jumps++;
+        }
+        player.jumpLock=true;
+    }
+
+    if(!jumpPressed)
+        player.jumpLock=false;
+
+    const previousY = player.y;
+    player.vy += (0.48 + altitude / 50000) * step;
+    player.x += player.vx;
+    player.y += player.vy * step;
+
+    let grounded = false;
+    let groundedPlatform = null;
+
+    for(const p of platforms){
+        if(
+            player.vy >= 0 &&
+            player.x + player.w > p.x &&
+            player.x < p.x + p.w &&
+            previousY + player.h <= p.y &&
+            player.y + player.h >= p.y
+        ){
+            player.y = p.y-player.h;
+            player.vy = 0;
+            grounded=true;
+            groundedPlatform=p;
+        }
+    }
+
+    if(grounded){
+        player.jumps=0;
+        if(groundedPlatform.falling){
+            groundedPlatform.fallTimer += step;
+            if(groundedPlatform.fallTimer > 25)
+                groundedPlatform.isFalling = true;
+        }
+    }
+
+    for(const p of platforms){
+        if(p.isFalling){
+            const fallDistance = 6 * step;
+            p.y += fallDistance;
+            if(p.enemy)
+                p.enemy.y += fallDistance;
+            if(p.laser)
+                p.laser.y += fallDistance;
+        }
+
+        const e = p.enemy;
+        if(e){
+            e.x += e.speed * e.dir * step;
+            if(e.x <= e.minX || e.x >= e.maxX){
+                e.x = Math.max(e.minX,Math.min(e.x,e.maxX));
+                e.dir *= -1;
+            }
+            if(
+                player.x < e.x + e.w &&
+                player.x + player.w > e.x &&
+                player.y < e.y + e.h &&
+                player.y + player.h > e.y
+            ){
+                resetGame();
+                return;
+            }
+        }
+
+        const laser = p.laser;
+        if(laser){
+            laser.timer += step;
+            if(laser.timer >= 60){
+                laser.active = !laser.active;
+                laser.timer = 0;
+            }
+            if(
+                laser.active &&
+                player.x + player.w > laser.x &&
+                player.x < laser.x + laser.width &&
+                player.y < laser.y + 5 &&
+                player.y + player.h > laser.y - 5
+            ){
+                resetGame();
+                return;
+            }
+        }
+    }
+
+    cameraY += (player.y - canvas.height / 2 - cameraY) * 0.08 * step;
+    lavaY -= lavaSpeed * step;
+    lavaSpeed = 0.15 + highestAltitude / 2500;
+
+    if(player.y + player.h > lavaY ||
+        player.y > cameraY + canvas.height + 500){
+        resetGame();
+        return;
+    }
+
+    platforms = platforms.filter(p => p.y <= cameraY + canvas.height + 500);
+}
+
+function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    const sky = ctx.createLinearGradient(0,0,0,canvas.height);
+    sky.addColorStop(0,"#4da6ff");
+    sky.addColorStop(1,"#001f3f");
+    ctx.fillStyle = sky;
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    ctx.save();
+    ctx.translate(canvas.width / 2 - player.x - player.w / 2,-cameraY);
+
+    ctx.fillStyle = "#ff3300";
+    ctx.shadowColor = "#ff6600";
+    ctx.shadowBlur = 30;
+    ctx.fillRect(-100000,lavaY,200000,100000);
+    ctx.shadowBlur = 0;
+
+    for(const p of platforms){
+        ctx.fillStyle="limegreen";
+        ctx.fillRect(p.x,p.y,p.w,p.h);
+        if(p.enemy){
+            ctx.fillStyle="crimson";
+            ctx.fillRect(p.enemy.x,p.enemy.y,p.enemy.w,p.enemy.h);
+        }
+        if(p.laser && p.laser.active){
+            ctx.strokeStyle="#ff0000";
+            ctx.lineWidth=4;
+            ctx.beginPath();
+            ctx.moveTo(p.laser.x,p.laser.y);
+            ctx.lineTo(p.laser.x + p.laser.width,p.laser.y);
+            ctx.stroke();
+        }
+    }
+
+    ctx.fillStyle="gold";
+    ctx.fillRect(player.x,player.y,player.w,player.h);
+    ctx.restore();
+}
+
+function loop(timestamp){
+    const delta = lastFrameTime ? timestamp - lastFrameTime : 1000 / 60;
+    lastFrameTime = timestamp;
+    update(delta);
+    draw();
+    requestAnimationFrame(loop);
+}
+
+configForm.addEventListener("submit",event=>{
+    event.preventDefault();
+    const url = projectUrlInput.value.trim().replace(/\/+$/,"");
+    const key = publicKeyInput.value.trim();
+    if(!url || !key)
+        return;
+    leaderboardConfig = {url,key};
+    try{
+        localStorage.setItem("parkourSupabaseConfig",JSON.stringify(leaderboardConfig));
+        setLeaderboardStatus("Connection saved. Loading worldwide scores…");
+        fetchLeaderboard();
+    }catch(error){
+        console.error("Could not save leaderboard configuration:",error);
+        setLeaderboardStatus("Could not save configuration in this browser.");
+    }
+});
+
+document.getElementById("refreshLeaderboard").addEventListener("click",fetchLeaderboard);
+
+scoreForm.addEventListener("submit",async event=>{
+    event.preventDefault();
+    if(submittingScore)
+        return;
+    submittingScore = true;
+    submitScoreButton.disabled = true;
+    gameOverStatus.textContent = "Submitting score…";
+    try{
+        const name = playerNameInput.value.trim().slice(0,20) || "Anonymous";
+        await submitLeaderboardScore(Math.floor(highestAltitude),name);
+        gameOverStatus.textContent = "Score submitted!";
+        await fetchLeaderboard();
+        window.setTimeout(()=>{
+            gameOverPanel.style.display = "none";
+            restartGame();
+        },700);
+    }catch(error){
+        console.error("Could not submit score:",error);
+        gameOverStatus.textContent = `${error.message} You can retry or skip.`;
+        submittingScore = false;
+        submitScoreButton.disabled = false;
+    }
+});
+
+document.getElementById("skipScore").addEventListener("click",()=>{
+    gameOverPanel.style.display = "none";
+    restartGame();
+});
+
+cameraY = player.y - canvas.height / 2;
+generateWorld();
+fetchLeaderboard();
+loop();
+</script>
+
+</body>
+</html>
